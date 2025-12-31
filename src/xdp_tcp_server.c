@@ -3,7 +3,7 @@
  * XDP TCP Server - Full TCP server running entirely in kernel mode
  * Zero context switches - packets never reach user space
  *
- * AWS/Cloud compatible version using bpf_redirect and incremental checksums
+ * AWS/Cloud compatible version with route-based responses
  */
 
 #include <linux/bpf.h>
@@ -53,10 +53,9 @@ static __always_inline __u32 generate_isn(__u32 src_ip, __u32 dst_ip,
 }
 
 /* ============================================================================
- * CHECKSUM HELPERS - Incremental updates for cloud compatibility
+ * CHECKSUM HELPERS
  * ============================================================================ */
 
-/* Fold a 32-bit checksum into 16 bits */
 static __always_inline __u16 csum_fold(__u32 csum)
 {
     csum = (csum & 0xffff) + (csum >> 16);
@@ -64,7 +63,6 @@ static __always_inline __u16 csum_fold(__u32 csum)
     return (__u16)~csum;
 }
 
-/* Update checksum when a 32-bit value changes */
 static __always_inline void update_csum(__sum16 *csum, __be32 old_val, __be32 new_val)
 {
     __u32 new_csum = ~((__u32)*csum) & 0xffff;
@@ -77,7 +75,6 @@ static __always_inline void update_csum(__sum16 *csum, __be32 old_val, __be32 ne
     *csum = (__sum16)~new_csum;
 }
 
-/* Update checksum when a 16-bit value changes */
 static __always_inline void update_csum16(__sum16 *csum, __be16 old_val, __be16 new_val)
 {
     __u32 new_csum = ~((__u32)*csum) & 0xffff;
@@ -88,7 +85,6 @@ static __always_inline void update_csum16(__sum16 *csum, __be16 old_val, __be16 
     *csum = (__sum16)~new_csum;
 }
 
-/* Calculate full IP checksum */
 static __always_inline __u16 ip_checksum(void *ip_hdr, void *data_end)
 {
     __u32 sum = 0;
@@ -108,14 +104,12 @@ static __always_inline __u16 ip_checksum(void *ip_hdr, void *data_end)
     return (__u16)~sum;
 }
 
-/* Calculate TCP checksum from scratch */
 static __always_inline __u16 tcp_checksum(struct iphdr *ip, struct tcphdr *tcp,
                                           void *data_end, __u16 tcp_len)
 {
     __u32 sum = 0;
     __u16 *ptr;
 
-    /* Pseudo-header */
     sum += (ip->saddr >> 16) & 0xFFFF;
     sum += ip->saddr & 0xFFFF;
     sum += (ip->daddr >> 16) & 0xFFFF;
@@ -124,8 +118,6 @@ static __always_inline __u16 tcp_checksum(struct iphdr *ip, struct tcphdr *tcp,
     sum += bpf_htons(tcp_len);
 
     ptr = (__u16 *)tcp;
-
-    /* Calculate number of complete 16-bit words */
     __u16 words = tcp_len / 2;
 
     #pragma unroll
@@ -138,8 +130,6 @@ static __always_inline __u16 tcp_checksum(struct iphdr *ip, struct tcphdr *tcp,
         ptr++;
     }
 
-    /* Handle odd byte at the end - on little-endian, don't shift!
-     * The odd byte is the LOW byte of a 16-bit word with HIGH byte = 0 */
     if ((tcp_len & 1) && (void *)ptr < data_end) {
         __u8 *byte_ptr = (__u8 *)ptr;
         if ((void *)(byte_ptr + 1) <= data_end)
@@ -164,26 +154,20 @@ static __always_inline void swap_mac(struct ethhdr *eth)
     __builtin_memcpy(eth->h_dest, tmp, ETH_ALEN);
 }
 
-/* Swap IPs and update checksums incrementally */
 static __always_inline void swap_ip_with_csum(struct iphdr *ip, struct tcphdr *tcp)
 {
     __be32 old_saddr = ip->saddr;
     __be32 old_daddr = ip->daddr;
 
-    /* Swap IPs */
     ip->saddr = old_daddr;
     ip->daddr = old_saddr;
 
-    /* Update IP checksum for IP swap */
     update_csum(&ip->check, old_saddr, ip->saddr);
     update_csum(&ip->check, old_daddr, ip->daddr);
-
-    /* Update TCP checksum for IP swap (pseudo-header) */
     update_csum(&tcp->check, old_saddr, ip->saddr);
     update_csum(&tcp->check, old_daddr, ip->daddr);
 }
 
-/* Swap ports and update TCP checksum */
 static __always_inline void swap_ports_with_csum(struct tcphdr *tcp)
 {
     __be16 old_source = tcp->source;
@@ -212,7 +196,6 @@ static __always_inline int handle_syn(struct xdp_md *ctx,
     if (stats)
         stats->syn_received++;
 
-    /* Create new session */
     struct session_state new_session = {0};
     new_session.state = TCP_STATE_SYN_RCVD;
     new_session.isn = generate_isn(key->src_ip, key->dst_ip,
@@ -229,20 +212,16 @@ static __always_inline int handle_syn(struct xdp_md *ctx,
         return XDP_DROP;
     }
 
-    /* Swap MAC addresses */
     swap_mac(eth);
 
-    /* Swap IP addresses */
     __be32 tmp_ip = ip->saddr;
     ip->saddr = ip->daddr;
     ip->daddr = tmp_ip;
 
-    /* Swap ports */
     __be16 tmp_port = tcp->source;
     tcp->source = tcp->dest;
     tcp->dest = tmp_port;
 
-    /* Set TCP header for SYN-ACK */
     tcp->seq = bpf_htonl(new_session.isn);
     tcp->ack_seq = bpf_htonl(new_session.their_seq);
     tcp->doff = 5;
@@ -258,14 +237,11 @@ static __always_inline int handle_syn(struct xdp_md *ctx,
     tcp->window = bpf_htons(WINDOW_SIZE);
     tcp->urg_ptr = 0;
 
-    /* Set IP length */
     ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
 
-    /* Recalculate IP checksum from scratch */
     ip->check = 0;
     ip->check = ip_checksum(ip, data_end);
 
-    /* Recalculate TCP checksum from scratch */
     tcp->check = 0;
     tcp->check = tcp_checksum(ip, tcp, data_end, sizeof(struct tcphdr));
 
@@ -322,20 +298,16 @@ static __always_inline int handle_fin(struct xdp_md *ctx,
     session->our_ack = session->their_seq;
     session->last_seen = bpf_ktime_get_ns();
 
-    /* Swap MAC addresses */
     swap_mac(eth);
 
-    /* Swap IP addresses */
     __be32 tmp_ip = ip->saddr;
     ip->saddr = ip->daddr;
     ip->daddr = tmp_ip;
 
-    /* Swap ports */
     __be16 tmp_port = tcp->source;
     tcp->source = tcp->dest;
     tcp->dest = tmp_port;
 
-    /* Set TCP header for FIN-ACK */
     tcp->seq = bpf_htonl(session->our_seq);
     tcp->ack_seq = bpf_htonl(session->our_ack);
     tcp->doff = 5;
@@ -351,10 +323,8 @@ static __always_inline int handle_fin(struct xdp_md *ctx,
     tcp->window = bpf_htons(session->window_size);
     tcp->urg_ptr = 0;
 
-    /* Set IP length */
     ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
 
-    /* Recalculate checksums from scratch */
     ip->check = 0;
     ip->check = ip_checksum(ip, data_end);
     tcp->check = 0;
@@ -379,18 +349,84 @@ static __always_inline int handle_final_ack(struct session_key *key)
 }
 
 /* ============================================================================
- * HTTP RESPONSE - Simple fixed response
+ * HTTP ROUTING - Parse request and select response
  * ============================================================================ */
 
-/*
- * HTTP Response (41 bytes):
- * HTTP/1.1 200 OK\r\n  = 17 bytes
- * Content-Length: 3\r\n = 19 bytes
- * \r\n                  = 2 bytes
- * Hi\n                  = 3 bytes
- * Total                 = 41 bytes
+/* Route IDs */
+#define ROUTE_HOME   0
+#define ROUTE_API    1
+#define ROUTE_HEALTH 2
+
+/* All responses are padded to same length for simplicity */
+#define HTTP_RESPONSE_LEN 55
+
+/* 
+ * Responses (all 55 bytes):
+ * /        -> "Hello from XDP!\n"  (16 chars body)
+ * /api     -> "{\"status\":\"ok\"}\n" (16 chars body)
+ * /health  -> "OK              \n" (16 chars body, padded)
  */
-#define HTTP_RESPONSE_LEN 41
+
+static __always_inline int parse_route(char *p, void *data_end)
+{
+    /* Check "GET / " at minimum */
+    if ((void *)(p + 14) > data_end)
+        return ROUTE_HOME;
+    
+    /* Must start with "GET /" */
+    if (p[0] != 'G' || p[1] != 'E' || p[2] != 'T' || p[3] != ' ' || p[4] != '/')
+        return ROUTE_HOME;
+    
+    /* Root path: "GET / " or "GET /?" */
+    if (p[5] == ' ' || p[5] == '?' || p[5] == 'H')
+        return ROUTE_HOME;
+    
+    /* /api path */
+    if (p[5] == 'a' && p[6] == 'p' && p[7] == 'i')
+        return ROUTE_API;
+    
+    /* /health path */
+    if (p[5] == 'h' && p[6] == 'e' && p[7] == 'a' && p[8] == 'l' && 
+        p[9] == 't' && p[10] == 'h')
+        return ROUTE_HEALTH;
+    
+    return ROUTE_HOME;
+}
+
+static __always_inline void write_http_response(char *payload, int route)
+{
+    /* HTTP header (39 bytes): "HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n" */
+    payload[0]='H';payload[1]='T';payload[2]='T';payload[3]='P';payload[4]='/';
+    payload[5]='1';payload[6]='.';payload[7]='1';payload[8]=' ';payload[9]='2';
+    payload[10]='0';payload[11]='0';payload[12]=' ';payload[13]='O';payload[14]='K';
+    payload[15]='\r';payload[16]='\n';
+    payload[17]='C';payload[18]='o';payload[19]='n';payload[20]='t';payload[21]='e';
+    payload[22]='n';payload[23]='t';payload[24]='-';payload[25]='L';payload[26]='e';
+    payload[27]='n';payload[28]='g';payload[29]='t';payload[30]='h';payload[31]=':';
+    payload[32]=' ';payload[33]='1';payload[34]='6';payload[35]='\r';payload[36]='\n';
+    payload[37]='\r';payload[38]='\n';
+
+    /* Body based on route (16 bytes each) */
+    if (route == ROUTE_API) {
+        /* {"status":"ok"}\n + space padding */
+        payload[39]='{';payload[40]='"';payload[41]='s';payload[42]='t';payload[43]='a';
+        payload[44]='t';payload[45]='u';payload[46]='s';payload[47]='"';payload[48]=':';
+        payload[49]='"';payload[50]='o';payload[51]='k';payload[52]='"';payload[53]='}';
+        payload[54]='\n';
+    } else if (route == ROUTE_HEALTH) {
+        /* OK + padding + \n */
+        payload[39]='O';payload[40]='K';payload[41]=' ';payload[42]=' ';payload[43]=' ';
+        payload[44]=' ';payload[45]=' ';payload[46]=' ';payload[47]=' ';payload[48]=' ';
+        payload[49]=' ';payload[50]=' ';payload[51]=' ';payload[52]=' ';payload[53]=' ';
+        payload[54]='\n';
+    } else {
+        /* Hello from XDP!\n */
+        payload[39]='H';payload[40]='e';payload[41]='l';payload[42]='l';payload[43]='o';
+        payload[44]=' ';payload[45]='f';payload[46]='r';payload[47]='o';payload[48]='m';
+        payload[49]=' ';payload[50]='X';payload[51]='D';payload[52]='P';payload[53]='!';
+        payload[54]='\n';
+    }
+}
 
 static __always_inline int handle_data(struct xdp_md *ctx,
                                        struct session_state *session,
@@ -405,42 +441,39 @@ static __always_inline int handle_data(struct xdp_md *ctx,
     if (stats)
         stats->bytes_received += payload_len;
 
-    /* Update session state with incoming data */
     session->their_seq = their_seq + payload_len;
     session->our_ack = session->their_seq;
     session->last_seen = bpf_ktime_get_ns();
 
-    /* ========================================================================
-     * CRITICAL FIX: Physically resize the packet buffer
-     *
-     * AWS Nitro/ENA hypervisors are strict: if the Ethernet frame size
-     * doesn't match the IP length field, the packet is dropped.
-     *
-     * We must use bpf_xdp_adjust_tail() to resize the buffer.
-     * ======================================================================== */
+    /* Parse request before resizing */
+    struct ethhdr *eth_pre = data;
+    if ((void *)(eth_pre + 1) > data_end)
+        return XDP_DROP;
+    
+    struct iphdr *ip_pre = (void *)(eth_pre + 1);
+    if ((void *)(ip_pre + 1) > data_end)
+        return XDP_DROP;
+    
+    struct tcphdr *tcp_pre = (void *)ip_pre + sizeof(struct iphdr);
+    if ((void *)(tcp_pre + 1) > data_end)
+        return XDP_DROP;
+    
+    char *req_payload = (char *)tcp_pre + sizeof(struct tcphdr);
+    int route = parse_route(req_payload, data_end);
 
-    /* Calculate current packet size and desired size */
+    /* Resize packet */
     long old_len = (long)data_end - (long)data;
-
-    /* Desired: Ethernet (14) + IP (20) + TCP (20) + HTTP (41) = 95 bytes */
     long desired_len = sizeof(struct ethhdr) + sizeof(struct iphdr) +
                        sizeof(struct tcphdr) + HTTP_RESPONSE_LEN;
-
-    /* Delta: positive to grow, negative to shrink */
     int delta = (int)(desired_len - old_len);
 
-    /* Resize the packet buffer */
     if (bpf_xdp_adjust_tail(ctx, delta)) {
         if (stats)
             stats->errors++;
         return XDP_DROP;
     }
 
-    /* ========================================================================
-     * CRITICAL: After bpf_xdp_adjust_tail, ALL pointers are invalidated.
-     * We MUST re-parse the packet from scratch.
-     * ======================================================================== */
-
+    /* Re-parse after resize */
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
 
@@ -456,69 +489,48 @@ static __always_inline int handle_data(struct xdp_md *ctx,
     if ((void *)(tcp + 1) > data_end)
         return XDP_DROP;
 
-    /* Payload starts after TCP header */
     char *payload = (char *)tcp + sizeof(struct tcphdr);
     if ((void *)(payload + HTTP_RESPONSE_LEN) > data_end)
         return XDP_DROP;
 
-    /* Swap MAC addresses */
     swap_mac(eth);
 
-    /* Swap IP addresses */
     __be32 tmp_ip = ip->saddr;
     ip->saddr = ip->daddr;
     ip->daddr = tmp_ip;
 
-    /* Swap ports */
     __be16 tmp_port = tcp->source;
     tcp->source = tcp->dest;
     tcp->dest = tmp_port;
 
-    /* Set TCP header for response */
     tcp->seq = bpf_htonl(session->our_seq);
     tcp->ack_seq = bpf_htonl(session->our_ack);
-    tcp->doff = 5;  /* 20-byte TCP header, no options */
+    tcp->doff = 5;
     tcp->res1 = 0;
     tcp->cwr = 0;
     tcp->ece = 0;
     tcp->urg = 0;
     tcp->ack = 1;
-    tcp->psh = 1;  /* Push data */
+    tcp->psh = 1;
     tcp->rst = 0;
     tcp->syn = 0;
     tcp->fin = 0;
     tcp->window = bpf_htons(session->window_size);
     tcp->urg_ptr = 0;
 
-    /* Write HTTP response payload (41 bytes) */
-    /* HTTP/1.1 200 OK\r\n (17 bytes) */
-    payload[0]='H';payload[1]='T';payload[2]='T';payload[3]='P';payload[4]='/';
-    payload[5]='1';payload[6]='.';payload[7]='1';payload[8]=' ';payload[9]='2';
-    payload[10]='0';payload[11]='0';payload[12]=' ';payload[13]='O';payload[14]='K';
-    payload[15]='\r';payload[16]='\n';
-    /* Content-Length: 3\r\n (19 bytes) */
-    payload[17]='C';payload[18]='o';payload[19]='n';payload[20]='t';payload[21]='e';
-    payload[22]='n';payload[23]='t';payload[24]='-';payload[25]='L';payload[26]='e';
-    payload[27]='n';payload[28]='g';payload[29]='t';payload[30]='h';payload[31]=':';
-    payload[32]=' ';payload[33]='3';payload[34]='\r';payload[35]='\n';
-    /* \r\n (2 bytes) */
-    payload[36]='\r';payload[37]='\n';
-    /* Hi\n (3 bytes) */
-    payload[38]='H';payload[39]='i';payload[40]='\n';
+    /* Write response based on route */
+    write_http_response(payload, route);
 
-    /* Set IP header with payload */
     ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + HTTP_RESPONSE_LEN);
     ip->ttl = 64;
-    ip->id = bpf_htons(bpf_ntohs(ip->id) + 1);  /* Increment IP ID to avoid dedup */
+    ip->id = bpf_htons(bpf_ntohs(ip->id) + 1);
 
-    /* Recalculate checksums */
     ip->check = 0;
     ip->check = ip_checksum(ip, data_end);
 
     tcp->check = 0;
     tcp->check = tcp_checksum(ip, tcp, data_end, sizeof(struct tcphdr) + HTTP_RESPONSE_LEN);
 
-    /* Update session state */
     session->our_seq += HTTP_RESPONSE_LEN;
     bpf_map_update_elem(&sessions, key, session, BPF_EXIST);
 

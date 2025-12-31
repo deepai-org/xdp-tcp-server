@@ -245,3 +245,29 @@ curl http://<public-ip>:3456/
 ```bash
 sudo apt-get install linux-headers-$(uname -r)
 ```
+
+## Routes
+
+The server responds to different paths:
+
+| Path | Response | Description |
+|------|----------|-------------|
+| `/` | `Hello from XDP\!` | Default greeting |
+| `/api` | `{"status":"ok"}` | JSON API response |
+| `/health` | `OK` | Health check endpoint |
+
+```bash
+curl http://<ip>:3456/        # Hello from XDP\!
+curl http://<ip>:3456/api     # {"status":"ok"}
+curl http://<ip>:3456/health  # OK
+```
+
+**Testing Tip**: When testing on the EC2 instance itself, use the public IP instead of localhost:
+
+```bash
+# This works (goes through network, XDP sees it):
+curl http://$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H X-aws-ec2-metadata-token-ttl-seconds:21600)" http://169.254.169.254/latest/meta-data/public-ipv4):3456/
+
+# This does NOT work (localhost routes internally, bypasses XDP):
+curl http://localhost:3456/
+```
