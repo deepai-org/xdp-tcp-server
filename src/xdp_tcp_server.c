@@ -3,7 +3,7 @@
  * XDP TCP Server - Full TCP server running entirely in kernel mode
  * Zero context switches - packets never reach user space
  *
- * AWS/Cloud compatible version with route-based responses
+ * AWS/Cloud compatible version with route-based responses and state
  */
 
 #include <linux/bpf.h>
@@ -33,6 +33,14 @@ struct {
     __type(key, __u32);
     __type(value, struct stats);
 } statistics SEC(".maps");
+
+/* Route hit counters - tracks requests per route */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 4);  /* 4 routes: home, api, health, stats */
+    __type(key, __u32);
+    __type(value, __u64);
+} route_hits SEC(".maps");
 
 /* ============================================================================
  * HELPER FUNCTIONS
@@ -356,46 +364,95 @@ static __always_inline int handle_final_ack(struct session_key *key)
 #define ROUTE_HOME   0
 #define ROUTE_API    1
 #define ROUTE_HEALTH 2
+#define ROUTE_STATS  3
 
-/* All responses are padded to same length for simplicity */
-#define HTTP_RESPONSE_LEN 55
-
-/* 
- * Responses (all 55 bytes):
- * /        -> "Hello from XDP!\n"  (16 chars body)
- * /api     -> "{\"status\":\"ok\"}\n" (16 chars body)
- * /health  -> "OK              \n" (16 chars body, padded)
- */
+/* All responses padded to same length */
+#define HTTP_RESPONSE_LEN 80
 
 static __always_inline int parse_route(char *p, void *data_end)
 {
-    /* Check "GET / " at minimum */
     if ((void *)(p + 14) > data_end)
         return ROUTE_HOME;
     
-    /* Must start with "GET /" */
     if (p[0] != 'G' || p[1] != 'E' || p[2] != 'T' || p[3] != ' ' || p[4] != '/')
         return ROUTE_HOME;
     
-    /* Root path: "GET / " or "GET /?" */
+    /* Root path */
     if (p[5] == ' ' || p[5] == '?' || p[5] == 'H')
         return ROUTE_HOME;
     
-    /* /api path */
+    /* /api */
     if (p[5] == 'a' && p[6] == 'p' && p[7] == 'i')
         return ROUTE_API;
     
-    /* /health path */
+    /* /health */
     if (p[5] == 'h' && p[6] == 'e' && p[7] == 'a' && p[8] == 'l' && 
         p[9] == 't' && p[10] == 'h')
         return ROUTE_HEALTH;
     
+    /* /stats */
+    if (p[5] == 's' && p[6] == 't' && p[7] == 'a' && p[8] == 't' && p[9] == 's')
+        return ROUTE_STATS;
+    
     return ROUTE_HOME;
+}
+
+/* Increment route counter */
+static __always_inline void increment_route_hit(__u32 route)
+{
+    __u64 *count = bpf_map_lookup_elem(&route_hits, &route);
+    if (count)
+        __sync_fetch_and_add(count, 1);
+}
+
+/* Get route hit count */
+static __always_inline __u64 get_route_hits(__u32 route)
+{
+    __u64 *count = bpf_map_lookup_elem(&route_hits, &route);
+    return count ? *count : 0;
+}
+
+/* Write a digit (0-9) */
+static __always_inline void write_digit(char *p, __u64 val)
+{
+    *p = '0' + (val % 10);
+}
+
+/* Write number (up to 9999999) into buffer, returns chars written */
+static __always_inline int write_number(char *buf, __u64 num)
+{
+    char tmp[8];
+    int i = 0;
+    
+    if (num == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    
+    /* Extract digits in reverse */
+    while (num > 0 && i < 7) {
+        tmp[i++] = '0' + (num % 10);
+        num /= 10;
+    }
+    
+    /* Copy in correct order */
+    int len = i;
+    for (int j = 0; j < len; j++) {
+        buf[j] = tmp[len - 1 - j];
+    }
+    
+    return len;
 }
 
 static __always_inline void write_http_response(char *payload, int route)
 {
-    /* HTTP header (39 bytes): "HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n" */
+    /* Get hit counts for stats route */
+    __u64 home_hits = get_route_hits(ROUTE_HOME);
+    __u64 api_hits = get_route_hits(ROUTE_API);
+    __u64 health_hits = get_route_hits(ROUTE_HEALTH);
+    __u64 stats_hits = get_route_hits(ROUTE_STATS);
+    
+    /* HTTP header: "HTTP/1.1 200 OK\r\nContent-Length: 41\r\n\r\n" (39 bytes) */
     payload[0]='H';payload[1]='T';payload[2]='T';payload[3]='P';payload[4]='/';
     payload[5]='1';payload[6]='.';payload[7]='1';payload[8]=' ';payload[9]='2';
     payload[10]='0';payload[11]='0';payload[12]=' ';payload[13]='O';payload[14]='K';
@@ -403,28 +460,63 @@ static __always_inline void write_http_response(char *payload, int route)
     payload[17]='C';payload[18]='o';payload[19]='n';payload[20]='t';payload[21]='e';
     payload[22]='n';payload[23]='t';payload[24]='-';payload[25]='L';payload[26]='e';
     payload[27]='n';payload[28]='g';payload[29]='t';payload[30]='h';payload[31]=':';
-    payload[32]=' ';payload[33]='1';payload[34]='6';payload[35]='\r';payload[36]='\n';
+    payload[32]=' ';payload[33]='4';payload[34]='1';payload[35]='\r';payload[36]='\n';
     payload[37]='\r';payload[38]='\n';
 
-    /* Body based on route (16 bytes each) */
-    if (route == ROUTE_API) {
-        /* {"status":"ok"}\n + space padding */
+    /* Body: 41 bytes (padded) */
+    if (route == ROUTE_STATS) {
+        /* {"home":N,"api":N,"health":N,"stats":N}\n */
+        payload[39]='{';payload[40]='"';payload[41]='h';payload[42]='o';payload[43]='m';
+        payload[44]='e';payload[45]='"';payload[46]=':';
+        /* home count - single digit for simplicity */
+        payload[47] = '0' + (home_hits % 10);
+        payload[48]=',';payload[49]='"';payload[50]='a';payload[51]='p';payload[52]='i';
+        payload[53]='"';payload[54]=':';
+        payload[55] = '0' + (api_hits % 10);
+        payload[56]=',';payload[57]='"';payload[58]='h';payload[59]='l';payload[60]='t';
+        payload[61]='h';payload[62]='"';payload[63]=':';
+        payload[64] = '0' + (health_hits % 10);
+        payload[65]=',';payload[66]='"';payload[67]='s';payload[68]='t';payload[69]='a';
+        payload[70]='t';payload[71]='s';payload[72]='"';payload[73]=':';
+        payload[74] = '0' + (stats_hits % 10);
+        payload[75]='}';payload[76]='\n';
+        payload[77]=' ';payload[78]=' ';payload[79]=' ';
+    } else if (route == ROUTE_API) {
+        /* {"status":"ok"}  + padding */
         payload[39]='{';payload[40]='"';payload[41]='s';payload[42]='t';payload[43]='a';
         payload[44]='t';payload[45]='u';payload[46]='s';payload[47]='"';payload[48]=':';
         payload[49]='"';payload[50]='o';payload[51]='k';payload[52]='"';payload[53]='}';
         payload[54]='\n';
+        /* Padding */
+        payload[55]=' ';payload[56]=' ';payload[57]=' ';payload[58]=' ';payload[59]=' ';
+        payload[60]=' ';payload[61]=' ';payload[62]=' ';payload[63]=' ';payload[64]=' ';
+        payload[65]=' ';payload[66]=' ';payload[67]=' ';payload[68]=' ';payload[69]=' ';
+        payload[70]=' ';payload[71]=' ';payload[72]=' ';payload[73]=' ';payload[74]=' ';
+        payload[75]=' ';payload[76]=' ';payload[77]=' ';payload[78]=' ';payload[79]=' ';
     } else if (route == ROUTE_HEALTH) {
-        /* OK + padding + \n */
-        payload[39]='O';payload[40]='K';payload[41]=' ';payload[42]=' ';payload[43]=' ';
-        payload[44]=' ';payload[45]=' ';payload[46]=' ';payload[47]=' ';payload[48]=' ';
-        payload[49]=' ';payload[50]=' ';payload[51]=' ';payload[52]=' ';payload[53]=' ';
-        payload[54]='\n';
+        /* OK + padding */
+        payload[39]='O';payload[40]='K';payload[41]='\n';
+        /* Padding */
+        payload[42]=' ';payload[43]=' ';payload[44]=' ';payload[45]=' ';payload[46]=' ';
+        payload[47]=' ';payload[48]=' ';payload[49]=' ';payload[50]=' ';payload[51]=' ';
+        payload[52]=' ';payload[53]=' ';payload[54]=' ';payload[55]=' ';payload[56]=' ';
+        payload[57]=' ';payload[58]=' ';payload[59]=' ';payload[60]=' ';payload[61]=' ';
+        payload[62]=' ';payload[63]=' ';payload[64]=' ';payload[65]=' ';payload[66]=' ';
+        payload[67]=' ';payload[68]=' ';payload[69]=' ';payload[70]=' ';payload[71]=' ';
+        payload[72]=' ';payload[73]=' ';payload[74]=' ';payload[75]=' ';payload[76]=' ';
+        payload[77]=' ';payload[78]=' ';payload[79]=' ';
     } else {
-        /* Hello from XDP!\n */
+        /* Hello from XDP! + padding */
         payload[39]='H';payload[40]='e';payload[41]='l';payload[42]='l';payload[43]='o';
         payload[44]=' ';payload[45]='f';payload[46]='r';payload[47]='o';payload[48]='m';
         payload[49]=' ';payload[50]='X';payload[51]='D';payload[52]='P';payload[53]='!';
         payload[54]='\n';
+        /* Padding */
+        payload[55]=' ';payload[56]=' ';payload[57]=' ';payload[58]=' ';payload[59]=' ';
+        payload[60]=' ';payload[61]=' ';payload[62]=' ';payload[63]=' ';payload[64]=' ';
+        payload[65]=' ';payload[66]=' ';payload[67]=' ';payload[68]=' ';payload[69]=' ';
+        payload[70]=' ';payload[71]=' ';payload[72]=' ';payload[73]=' ';payload[74]=' ';
+        payload[75]=' ';payload[76]=' ';payload[77]=' ';payload[78]=' ';payload[79]=' ';
     }
 }
 
@@ -460,6 +552,9 @@ static __always_inline int handle_data(struct xdp_md *ctx,
     
     char *req_payload = (char *)tcp_pre + sizeof(struct tcphdr);
     int route = parse_route(req_payload, data_end);
+    
+    /* Increment hit counter for this route */
+    increment_route_hit(route);
 
     /* Resize packet */
     long old_len = (long)data_end - (long)data;
