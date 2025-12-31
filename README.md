@@ -168,3 +168,80 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 ## License
 
 GPL-2.0
+
+## AWS EC2 Setup
+
+Running XDP on AWS EC2 requires specific considerations due to the ENA (Elastic Network Adapter) driver.
+
+### Quick Start on EC2
+
+```bash
+# Install dependencies (Ubuntu 24.04)
+sudo apt-get update
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev \
+    linux-headers-$(uname -r) linux-tools-common linux-tools-$(uname -r)
+
+# Clone and build
+git clone https://github.com/deepai-org/xdp-tcp-server.git
+cd xdp-tcp-server
+make
+
+# Change port if needed (edit include/common.h, then rebuild)
+# #define SERVER_PORT 3456
+
+# Attach to ens5 in SKB mode (required for ENA)
+sudo ./xdp_loader -S ens5
+```
+
+### Important Notes
+
+1. **SKB Mode Required**: The ENA driver does not support native XDP mode. Always use `-S` flag:
+   ```bash
+   sudo ./xdp_loader -S ens5    # Works
+   sudo ./xdp_loader ens5       # Fails with "Invalid argument"
+   ```
+
+2. **Interface Name**: EC2 instances use `ens5` (not `eth0`):
+   ```bash
+   ip link show  # Find your interface name
+   ```
+
+3. **Security Group**: Open the port in your EC2 security group:
+   - Type: Custom TCP
+   - Port: 3456 (or your configured port)
+   - Source: Your IP or 0.0.0.0/0
+
+4. **Local Traffic Does Not Work**: XDP on the physical interface only sees external traffic. Packets from localhost are routed internally by the kernel and never reach `ens5`:
+   ```bash
+   # This will NOT work (from the same EC2 instance):
+   curl http://localhost:3456/
+   
+   # This WILL work (from your laptop or another machine):
+   curl http://<public-ip>:3456/
+   ```
+
+### Testing from External Machine
+
+```bash
+# Get your EC2 public IP
+curl http://169.254.169.254/latest/meta-data/public-ipv4
+
+# From your laptop:
+curl http://<public-ip>:3456/
+# Expected: HTTP/1.1 200 OK with body "Hi"
+```
+
+### Troubleshooting
+
+**"Invalid argument" when loading:**
+- Use SKB mode: `sudo ./xdp_loader -S ens5`
+
+**No response to requests:**
+- Check security group allows inbound traffic on the port
+- Test from an external machine (not localhost)
+- Verify XDP is attached: `ip link show ens5` (should show `xdp`)
+
+**Build fails with missing headers:**
+```bash
+sudo apt-get install linux-headers-$(uname -r)
+```
